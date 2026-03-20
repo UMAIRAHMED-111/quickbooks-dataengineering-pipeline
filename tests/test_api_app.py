@@ -1,0 +1,125 @@
+import sys
+from pathlib import Path
+
+import pytest
+
+_SRC = Path(__file__).resolve().parent.parent / "src"
+sys.path.insert(0, str(_SRC))
+
+from qbo_pipeline.web.app import create_app
+
+
+@pytest.fixture
+def client(monkeypatch):
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("SUPABASE_DB_URL", raising=False)
+    app = create_app()
+    app.config["TESTING"] = True
+    return app.test_client()
+
+
+def test_health(client):
+    r = client.get("/health")
+    assert r.status_code == 200
+    assert r.get_json()["status"] == "ok"
+
+
+def test_catalog_no_db(client):
+    r = client.get("/api/v1/metrics/catalog")
+    assert r.status_code == 200
+    data = r.get_json()
+    assert "endpoints" in data
+    assert any("paid-vs-unpaid" in p for p in data["endpoints"])
+    assert any("POST /api/v1/qa" in p for p in data["endpoints"])
+
+
+def test_overview_503_without_database_url(client):
+    r = client.get("/api/v1/metrics/overview")
+    assert r.status_code == 503
+    assert "error" in r.get_json()
+
+
+def test_sync_401_when_secret_configured(client, monkeypatch):
+    monkeypatch.setenv("SYNC_API_SECRET", "expected-token")
+    r = client.post("/api/v1/sync")
+    assert r.status_code == 401
+
+
+def test_sync_invokes_run_sync_when_authed(client, monkeypatch):
+    monkeypatch.setenv("SYNC_API_SECRET", "expected-token")
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost/db")
+    monkeypatch.setenv("N8N_WEBHOOK_URL", "http://example.invalid/webhook")
+    called: list = []
+
+    def fake_run_sync(settings, local_path=None):
+        called.append(local_path)
+        return "sync-uuid-123"
+
+    monkeypatch.setattr("qbo_pipeline.web.app.run_sync", fake_run_sync)
+    r = client.post(
+        "/api/v1/sync",
+        headers={"Authorization": "Bearer expected-token"},
+    )
+    assert r.status_code == 200
+    assert r.get_json()["sync_run_id"] == "sync-uuid-123"
+    assert called == [None]
+
+
+def test_qa_400_empty_question(client):
+    r = client.post("/api/v1/qa", json={"question": "   "})
+    assert r.status_code == 400
+    assert r.get_json()["error"] == "invalid_request"
+
+
+def test_qa_400_missing_json(client):
+    r = client.post(
+        "/api/v1/qa",
+        data="not-json",
+        content_type="text/plain",
+    )
+    assert r.status_code == 400
+
+
+def test_qa_503_without_config(client):
+    r = client.post("/api/v1/qa", json={"question": "How many customers?"})
+    assert r.status_code == 503
+    body = r.get_json()
+    assert body["error"] == "service_unavailable"
+
+
+def test_qa_200_mocked(client, monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost/db")
+    monkeypatch.setenv("OPENAI_API_KEY_1", "fake-openai-key-for-test")
+
+    def fake_answer(cfg, question):
+        assert "unpaid" in question
+        return "There are 3 unpaid invoices."
+
+    monkeypatch.setattr(
+        "qbo_pipeline.web.app.answer_question",
+        fake_answer,
+    )
+    r = client.post("/api/v1/qa", json={"question": "List unpaid stuff"})
+    assert r.status_code == 200
+    data = r.get_json()
+    assert data["answer"] == "There are 3 unpaid invoices."
+    assert data["question"] == "List unpaid stuff"
+    assert "display" in data
+    assert data["display"]["format"] == "markdown"
+    assert "markdown" in data["display"]
+
+
+def test_sync_local_file_json_body(client, monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost/db")
+    monkeypatch.setenv("N8N_WEBHOOK_URL", "http://example.invalid/webhook")
+
+    def fake_run_sync(settings, local_path=None):
+        return f"path:{local_path}"
+
+    monkeypatch.setattr("qbo_pipeline.web.app.run_sync", fake_run_sync)
+    r = client.post(
+        "/api/v1/sync",
+        json={"local_file": "data/sample.json"},
+    )
+    assert r.status_code == 200
+    assert r.get_json()["sync_run_id"] == "path:data/sample.json"
