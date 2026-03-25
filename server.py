@@ -16,15 +16,11 @@ Requires DATABASE_URL plus OPENAI_API_KEY_1/2 and/or GEMINI_API_KEY (or GOOGLE_A
 from __future__ import annotations
 
 import os
-import sys
 from pathlib import Path
 
-from dotenv import load_dotenv
+from repo_bootstrap import configure_for_checkout
 
-load_dotenv()
-
-_SRC = Path(__file__).resolve().parent / "src"
-sys.path.insert(0, str(_SRC))
+configure_for_checkout(Path(__file__))
 
 from qbo_pipeline.web.app import create_app  # noqa: E402
 

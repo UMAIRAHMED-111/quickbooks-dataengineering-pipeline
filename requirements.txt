@@ -11,3 +11,5 @@ flask>=3,<4
 flask-cors>=4,<6
 
 # Tests: pip install -e ".[dev]"   or   pip install "pytest>=8,<9"
+#
+# Airflow (optional, same venv as this app): pip install -e ".[airflow]"   or   pip install "apache-airflow>=3,<4"

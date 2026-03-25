@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Run the pipeline without `pip install -e .` — adds ./src to import path.
+Run the pipeline without `pip install -e .` — adds ./src and loads repo `.env`.
 
 Still need deps: pip install -r requirements.txt
 
@@ -10,11 +10,11 @@ Usage:
 """
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 
-_SRC = Path(__file__).resolve().parent / "src"
-sys.path.insert(0, str(_SRC)) 
+from repo_bootstrap import configure_for_checkout
+
+configure_for_checkout(Path(__file__))
 
 from qbo_pipeline.etl.run import main  # noqa: E402
 

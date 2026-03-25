@@ -23,6 +23,10 @@ dependencies = [
 dev = [
   "pytest>=8,<9",
 ]
+# Orchestration DAGs (Airflow 3.x — aligns with Flask 3 from the main app; Airflow 2.x pins Flask<2.3).
+airflow = [
+  "apache-airflow>=3,<4",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -5,8 +5,9 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-_SRC = Path(__file__).resolve().parent / "src"
-sys.path.insert(0, str(_SRC))
+from repo_bootstrap import configure_for_checkout
+
+configure_for_checkout(Path(__file__))
 
 from qbo_pipeline.qa.warehouse_qa import main  # noqa: E402
 

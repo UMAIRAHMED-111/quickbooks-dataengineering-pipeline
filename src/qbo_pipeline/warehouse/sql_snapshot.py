@@ -28,7 +28,7 @@ PACK_DESCRIPTIONS: tuple[tuple[str, str], ...] = (
     ("counts_basic", "Counts of customers, invoices, and payment rows."),
     (
         "payments_summary",
-        "Payment total_amount sum and count: all time, and last 30 days by txn_date.",
+        "Payment total_amount sum and count: all time, calendar current month (txn_date), last 30 days.",
     ),
     (
         "unpaid_totals",
@@ -75,6 +75,18 @@ def _pack_payments_summary(cur: Cursor) -> list[str]:
     amt_all, n_all = cur.fetchone()
     lines.append(
         f"- **Payments (all time):** {n_all} rows, **SUM(total_amount)** ≈ {amt_all}"
+    )
+    cur.execute(
+        """
+        SELECT COALESCE(SUM(total_amount), 0), COUNT(*)
+        FROM public.payments
+        WHERE txn_date >= date_trunc('month', CURRENT_DATE)::date
+          AND txn_date <= CURRENT_DATE
+        """
+    )
+    amt_mo, n_mo = cur.fetchone()
+    lines.append(
+        f"- **Payments (calendar month to date, txn_date):** {n_mo} rows, **SUM(total_amount)** ≈ {amt_mo}"
     )
     cur.execute(
         """

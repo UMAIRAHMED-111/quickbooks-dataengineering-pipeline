@@ -55,6 +55,8 @@ class WarehouseQaConfig:
     gemini_sql_model: str
     use_snapshot_planner: bool
     use_dynamic_sql: bool
+    qa_context_max_chars: int
+    qa_context_max_messages: int
 
     @staticmethod
     def from_env() -> WarehouseQaConfig:
@@ -89,6 +91,20 @@ class WarehouseQaConfig:
         use_dynamic_sql = os.getenv(
             "WAREHOUSE_QA_DYNAMIC_SQL", ""
         ).strip().lower() in ("1", "true", "yes")
+        try:
+            qa_context_max_chars = int(
+                os.getenv("WAREHOUSE_QA_CONTEXT_MAX_CHARS", "12000").strip()
+            )
+        except ValueError:
+            qa_context_max_chars = 12_000
+        qa_context_max_chars = max(0, min(qa_context_max_chars, 100_000))
+        try:
+            qa_context_max_messages = int(
+                os.getenv("WAREHOUSE_QA_CONTEXT_MAX_MESSAGES", "24").strip()
+            )
+        except ValueError:
+            qa_context_max_messages = 24
+        qa_context_max_messages = max(0, min(qa_context_max_messages, 100))
         return WarehouseQaConfig(
             database_url=db,
             openai_api_key_1=k1 or None,
@@ -102,4 +118,6 @@ class WarehouseQaConfig:
             gemini_sql_model=g_sql,
             use_snapshot_planner=not no_planner,
             use_dynamic_sql=use_dynamic_sql,
+            qa_context_max_chars=qa_context_max_chars,
+            qa_context_max_messages=qa_context_max_messages,
         )

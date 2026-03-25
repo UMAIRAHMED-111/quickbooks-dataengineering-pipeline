@@ -11,6 +11,7 @@ import sys
 from google.genai.errors import APIError
 
 from qbo_pipeline.config import WarehouseQaConfig
+from qbo_pipeline.qa.context_window import build_context_prefix, normalize_context_turns
 from qbo_pipeline.qa.dynamic_sql import (
     SCHEMA_FOR_LLM,
     execute_validated_select,
@@ -18,6 +19,7 @@ from qbo_pipeline.qa.dynamic_sql import (
     validate_readonly_select,
 )
 from qbo_pipeline.qa.llm_complete import complete_qa_llm
+from qbo_pipeline.qa.small_talk import try_small_talk_reply
 from qbo_pipeline.warehouse.sql_snapshot import (
     ALL_PACK_IDS,
     PACK_DESCRIPTIONS,
@@ -31,19 +33,22 @@ Output rules:
 - No markdown, no explanation, no code fences.
 - Choose from the ids listed in the user message only. Omit sections that are clearly irrelevant to save tokens.
 - For any question about money owed, unpaid bills, balances, or who owes: include "unpaid_totals" and usually "customers_owing"; add "sample_open_invoices" if they need names/examples.
-- For payments, cash received, payment volume, totals paid, or last 7/30/90 days payment amounts: include "payments_summary".
+- For payments, cash received, payment volume, totals paid, **this month / current month**, last 7/30/90 days: include "payments_summary".
 - For email / sent invoice questions: include "email_status" and often "sample_unpaid_unsent".
 - For vague or broad questions ("how is the business", "summary"): include all ids from the list.
 
-Note: "counts_basic" is always added by the server; you may omit it from your array. When unsure, include more packs."""
+Note: "counts_basic" is always added by the server; you may omit it from your array. When unsure, include more packs.
+- If a PRIOR CONVERSATION block appears, use it only to interpret follow-up wording; still choose packs from the **current** question."""
 
 _ANSWER_SYSTEM = """You are a concise business analyst for QuickBooks data in a SQL warehouse.
 
 Rules:
 1. Use **WAREHOUSE_SNAPSHOT** only — exact aggregates and sample rows from live SQL.
 2. **Structure:** One short opening sentence on its own line (the key takeaway). Then a blank line. Then supporting facts as bullet lines, each starting with "- " (dash space). Use **bold** only for important numbers and entity names inside bullets or the opening line.
-3. If something is not in the snapshot, say it is not in this sync.
-4. Do not invent numbers or entities that are not in WAREHOUSE_SNAPSHOT.
+3. For **this month** / **current month** payment totals, use the snapshot line **Payments (calendar month to date, txn_date)** (and last 30 days / all time if needed). Do not say data is missing if that line is present with numbers.
+4. If a **PRIOR CONVERSATION** block appears, use it only for pronouns and follow-up intent. **All numeric facts must still come from WAREHOUSE_SNAPSHOT**, not from earlier assistant replies.
+5. If something is not in the snapshot, say it is not in this sync.
+6. Do not invent numbers or entities that are not in WAREHOUSE_SNAPSHOT.
 """
 
 _SQL_GEN_SYSTEM = """You write one PostgreSQL SELECT for analytics (read-only).
@@ -51,21 +56,53 @@ _SQL_GEN_SYSTEM = """You write one PostgreSQL SELECT for analytics (read-only).
 Output rules:
 - Output ONLY the SQL. No markdown fences, no explanation, no trailing semicolon.
 - Single SELECT (WITH … CTEs allowed). Only base tables in public: customers, invoices, payments, payment_invoice_allocations, sync_runs.
+- **FROM/JOIN scope:** Every column reference (e.g. p.txn_date) MUST use a table alias that appears in **this** SELECT’s FROM or JOIN at the **same** nesting level. Never write payments.col in a WHERE/HAVING unless `payments` (or alias `p`) is in that subquery’s FROM.
+- Prefer `FROM public.payments p` then `p.txn_date`, `p.total_amount`. Same for `public.invoices i`, `public.customers c`.
 - Join: invoices.customer_id = customers.id; payment_invoice_allocations links payments and invoices.
 - Prefer clear column names. If the answer could be many detail rows, add LIMIT 200. Pure aggregates (COUNT/SUM) do not need LIMIT.
+- **This month** on payments: use a **date range** (not equality on two DATE_TRUNCs):
+  p.txn_date >= date_trunc('month', CURRENT_DATE)::date AND p.txn_date <= CURRENT_DATE
+- Do not compare DATE_TRUNC('month', CURRENT_DATE) to DATE_TRUNC('month', p.txn_date); use the range form above.
 """
 
 _ANSWER_FROM_SQL_SYSTEM = """You summarize QUERY_RESULT for a business user.
 
 Rules:
 1. Every number and name must come from QUERY_RESULT; do not invent data.
-2. If there are no rows, say the query returned no rows.
-3. **Structure:** One short opening sentence (takeaway), blank line, then "- " bullets for details. Use **bold** sparingly for key figures and names.
+2. If QUERY_RESULT shows **zero matching rows** or no usable numbers for the question: explain in plain language that **no matching data appeared in the synced warehouse for that period or filter**. Never say "query", "SQL", "rows", "empty result", or "the query returned no rows". Suggest trying a broader time range (e.g. all payments, or last 30 days) when relevant.
+3. If **PRIOR CONVERSATION** is present, use it only to understand the **current** question; numbers must still come only from QUERY_RESULT.
+4. **Structure:** One short opening sentence (takeaway), blank line, then "- " bullets for details. Use **bold** sparingly for key figures and names.
 """
 
 
-def _generate_sql(cfg: WarehouseQaConfig, question: str) -> str:
-    user = f"Schema:\n{SCHEMA_FOR_LLM}\n\nQuestion: {question}\n\nSQL only:"
+def _sanitize_qa_answer_text(text: str) -> str:
+    """Replace technical empty-result wording with user-friendly copy (safety net)."""
+    stripped = (text or "").strip()
+    if not stripped:
+        return stripped
+    low = stripped.lower()
+    triggers = (
+        "the query returned no rows",
+        "query returned no rows",
+        "returned no rows",
+        "no rows returned",
+        "empty result set",
+        "the query returned zero rows",
+        "query returned zero rows",
+        "zero rows",
+    )
+    if any(t in low for t in triggers):
+        return (
+            "I’m not able to answer that precisely from the synced data right now—nothing in the "
+            "warehouse matched that request (often the case for a narrow date like “this month” if "
+            "there were no payments in that window). Try asking for **all payments received** or "
+            "**the last 30 days**, or confirm your QuickBooks sync includes those dates."
+        )
+    return stripped
+
+
+def _generate_sql(cfg: WarehouseQaConfig, question: str, context_prefix: str) -> str:
+    user = f"{context_prefix}Schema:\n{SCHEMA_FOR_LLM}\n\nQuestion: {question}\n\nSQL only:"
     return complete_qa_llm(
         cfg,
         task="sql_generate",
@@ -76,13 +113,40 @@ def _generate_sql(cfg: WarehouseQaConfig, question: str) -> str:
     )
 
 
-def _answer_via_dynamic_sql(cfg: WarehouseQaConfig, question: str) -> str:
-    raw = _generate_sql(cfg, question)
+def _answer_via_dynamic_sql(
+    cfg: WarehouseQaConfig, question: str, context_prefix: str
+) -> str:
+    raw = _generate_sql(cfg, question, context_prefix)
     sql = validate_readonly_select(raw)
-    cols, rows, truncated = execute_validated_select(cfg.database_url, sql)
+    try:
+        cols, rows, truncated = execute_validated_select(cfg.database_url, sql)
+    except Exception as exc:
+        err = str(exc).replace("\n", " ")[:800]
+        fix_user = (
+            f"{context_prefix}"
+            "PostgreSQL rejected the previous SQL with this error:\n"
+            f"{err}\n\n"
+            f"Schema:\n{SCHEMA_FOR_LLM}\n\n"
+            f"Original question: {question}\n\n"
+            "Output ONE corrected SELECT only. Rules: every table/alias used in SELECT/WHERE "
+            "must appear in FROM or JOIN at the same subquery level. "
+            "For payments use `FROM public.payments p` and `p.txn_date`, `p.total_amount`. "
+            "For this month use: p.txn_date >= date_trunc('month', CURRENT_DATE)::date AND p.txn_date <= CURRENT_DATE\n\n"
+            "SQL only:"
+        )
+        raw2 = complete_qa_llm(
+            cfg,
+            task="sql_generate",
+            system_instruction=_SQL_GEN_SYSTEM,
+            user_content=fix_user,
+            temperature=0.0,
+            max_output_tokens=512,
+        )
+        sql = validate_readonly_select(raw2)
+        cols, rows, truncated = execute_validated_select(cfg.database_url, sql)
     block = format_result_for_llm(cols, rows, sql, truncated=truncated)
-    user = f"Question: {question}\n\n--- QUERY_RESULT ---\n{block}\n"
-    return complete_qa_llm(
+    user = f"{context_prefix}Question: {question}\n\n--- QUERY_RESULT ---\n{block}\n"
+    out = complete_qa_llm(
         cfg,
         task="answer_from_sql",
         system_instruction=_ANSWER_FROM_SQL_SYSTEM,
@@ -90,6 +154,7 @@ def _answer_via_dynamic_sql(cfg: WarehouseQaConfig, question: str) -> str:
         temperature=0.2,
         max_output_tokens=900,
     )
+    return _sanitize_qa_answer_text(out)
 
 
 def _dynamic_sql_fallback_exc(exc: Exception) -> None:
@@ -145,9 +210,11 @@ def _parse_pack_list(raw: str) -> frozenset[str]:
     return frozenset(out) if out else ALL_PACK_IDS
 
 
-def plan_snapshot_packs(cfg: WarehouseQaConfig, question: str) -> frozenset[str]:
+def plan_snapshot_packs(
+    cfg: WarehouseQaConfig, question: str, context_prefix: str
+) -> frozenset[str]:
     catalog = _catalog_lines_for_planner()
-    user = f"{catalog}\n\nQuestion: {question}\n\nJSON array of pack ids only:"
+    user = f"{context_prefix}{catalog}\n\nQuestion: {question}\n\nJSON array of pack ids only:"
     raw = complete_qa_llm(
         cfg,
         task="planner",
@@ -160,25 +227,41 @@ def plan_snapshot_packs(cfg: WarehouseQaConfig, question: str) -> frozenset[str]
     return frozenset(packs | {"counts_basic"})
 
 
-def answer_question(cfg: WarehouseQaConfig, question: str) -> str:
+def answer_question(
+    cfg: WarehouseQaConfig,
+    question: str,
+    *,
+    context: list[dict[str, str]] | None = None,
+) -> str:
+    chit = try_small_talk_reply(question)
+    if chit is not None:
+        return chit
+
+    turns = normalize_context_turns(context) if context else []
+    ctx_prefix = build_context_prefix(
+        turns,
+        max_chars=cfg.qa_context_max_chars,
+        max_messages=cfg.qa_context_max_messages,
+    )
+
     if cfg.use_dynamic_sql:
         try:
-            return _answer_via_dynamic_sql(cfg, question)
+            return _answer_via_dynamic_sql(cfg, question, ctx_prefix)
         except APIError:
             raise
         except Exception as exc:
             _dynamic_sql_fallback_exc(exc)
 
     if cfg.use_snapshot_planner:
-        packs = plan_snapshot_packs(cfg, question)
+        packs = plan_snapshot_packs(cfg, question, ctx_prefix)
     else:
         packs = ALL_PACK_IDS
 
     summary = fetch_warehouse_summary(cfg.database_url, packs)
     user_content = (
-        f"Question: {question}\n\n--- WAREHOUSE_SNAPSHOT ---\n{summary}\n"
+        f"{ctx_prefix}Question: {question}\n\n--- WAREHOUSE_SNAPSHOT ---\n{summary}\n"
     )
-    return complete_qa_llm(
+    out = complete_qa_llm(
         cfg,
         task="answer_snapshot",
         system_instruction=_ANSWER_SYSTEM,
@@ -186,6 +269,7 @@ def answer_question(cfg: WarehouseQaConfig, question: str) -> str:
         temperature=0.2,
         max_output_tokens=900,
     )
+    return _sanitize_qa_answer_text(out)
 
 
 def main(argv: list[str] | None = None) -> int:

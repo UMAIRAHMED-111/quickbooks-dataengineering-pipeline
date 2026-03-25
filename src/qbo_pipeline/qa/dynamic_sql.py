@@ -30,6 +30,9 @@ customers(id uuid, qbo_id text, display_name text, company_name text, balance nu
 invoices(id uuid, qbo_id text, customer_id uuid -> customers.id, doc_number text, txn_date date,
   due_date date, total_amount numeric, balance numeric, is_email_sent boolean, email_status text, ...)
 payments(id uuid, qbo_id text, customer_id uuid -> customers.id, txn_date date, total_amount numeric, ...)
+  This-month payments (copy this pattern; use alias p and keep p in FROM):
+  SELECT COALESCE(SUM(p.total_amount), 0) AS total, COUNT(*) AS n FROM public.payments p
+  WHERE p.txn_date >= date_trunc('month', CURRENT_DATE)::date AND p.txn_date <= CURRENT_DATE
 payment_invoice_allocations(id uuid, payment_id uuid -> payments.id, invoice_id uuid -> invoices.id, amount numeric)
 sync_runs(id uuid, started_at timestamptz, status text, customer_count int, invoice_count int, ...)
 """.strip()
@@ -161,4 +164,12 @@ def format_result_for_llm(
     lines.append(" | ".join(colnames))
     for tup in rows:
         lines.append(" | ".join(str(v) if v is not None else "" for v in tup))
+    if len(rows) == 0:
+        lines.append("")
+        lines.append(
+            "NOTE: Zero data rows matched this SQL. When answering the user: do NOT mention "
+            '"query", "SQL", "rows", or "empty result". Say clearly that no matching payments/invoices '
+            "were found in the warehouse for that filter or time range, and suggest trying a broader "
+            "period (e.g. all time or last 30 days) if helpful."
+        )
     return "\n".join(lines)

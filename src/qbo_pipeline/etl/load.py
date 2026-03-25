@@ -126,6 +126,31 @@ def _insert_batches(
         cur.execute(sql, flat)
 
 
+def _insert_qbo_bundle(cur: Any, bundle: LoadBundle, chunk: int) -> None:
+    _insert_batches(
+        cur,
+        "customers",
+        _CUSTOMER_COLS,
+        _CUSTOMER_JSON,
+        bundle.customers,
+        chunk,
+    )
+    _insert_batches(
+        cur, "invoices", _INVOICE_COLS, _NO_JSON_COLS, bundle.invoices, chunk
+    )
+    _insert_batches(
+        cur, "payments", _PAYMENT_COLS, _NO_JSON_COLS, bundle.payments, chunk
+    )
+    _insert_batches(
+        cur,
+        "payment_invoice_allocations",
+        _ALLOC_COLS,
+        _NO_JSON_COLS,
+        bundle.payment_invoice_allocations,
+        chunk,
+    )
+
+
 def _start_sync_run(conninfo: str) -> UUID:
     conn = psycopg2.connect(conninfo)
     conn.autocommit = True
@@ -162,6 +187,76 @@ def _finalize_sync_failed(conninfo: str, sync_id: UUID, message: str) -> None:
         conn.close()
 
 
+def run_delete_phase(settings: Settings) -> str:
+    """Start ``sync_runs`` (running) and commit ``DELETE FROM customers`` (CASCADE).
+
+    For Airflow-style splits: run after n8n fetch, before inserts. If this succeeds and
+    inserts never run, the warehouse is empty until the next successful sync.
+    """
+    conninfo = settings.supabase_database_url
+    try:
+        sync_id = _start_sync_run(conninfo)
+    except Exception as exc:
+        hint = _supabase_pooler_hint(conninfo, exc)
+        raise RuntimeError(f"{exc}{hint}") from exc
+
+    conn = psycopg2.connect(conninfo)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM public.customers")
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        msg = str(exc) + _supabase_pooler_hint(conninfo, exc)
+        _finalize_sync_failed(conninfo, sync_id, msg)
+        raise RuntimeError(msg) from exc
+    finally:
+        conn.close()
+
+    return str(sync_id)
+
+
+def run_insert_phase(settings: Settings, sync_id: UUID, bundle: LoadBundle) -> str:
+    """Insert bundle rows and mark ``sync_runs`` success (one transaction)."""
+    conninfo = settings.supabase_database_url
+    chunk = settings.supabase_insert_chunk_size
+    conn = psycopg2.connect(conninfo)
+    try:
+        with conn.cursor() as cur:
+            _insert_qbo_bundle(cur, bundle, chunk)
+            finished = datetime.now(timezone.utc)
+            cur.execute(
+                """
+                UPDATE public.sync_runs
+                SET finished_at = %s,
+                    status = 'success',
+                    customer_count = %s,
+                    invoice_count = %s,
+                    payment_count = %s,
+                    allocation_count = %s
+                WHERE id = %s
+                """,
+                (
+                    finished,
+                    len(bundle.customers),
+                    len(bundle.invoices),
+                    len(bundle.payments),
+                    len(bundle.payment_invoice_allocations),
+                    str(sync_id),
+                ),
+            )
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        msg = str(exc) + _supabase_pooler_hint(conninfo, exc)
+        _finalize_sync_failed(conninfo, sync_id, msg)
+        raise RuntimeError(msg) from exc
+    finally:
+        conn.close()
+
+    return str(sync_id)
+
+
 def load(settings: Settings, bundle: LoadBundle) -> str:
     conninfo = settings.supabase_database_url
     try:
@@ -175,28 +270,7 @@ def load(settings: Settings, bundle: LoadBundle) -> str:
     try:
         with conn.cursor() as cur:
             cur.execute("DELETE FROM public.customers")
-            _insert_batches(
-                cur,
-                "customers",
-                _CUSTOMER_COLS,
-                _CUSTOMER_JSON,
-                bundle.customers,
-                chunk,
-            )
-            _insert_batches(
-                cur, "invoices", _INVOICE_COLS, _NO_JSON_COLS, bundle.invoices, chunk
-            )
-            _insert_batches(
-                cur, "payments", _PAYMENT_COLS, _NO_JSON_COLS, bundle.payments, chunk
-            )
-            _insert_batches(
-                cur,
-                "payment_invoice_allocations",
-                _ALLOC_COLS,
-                _NO_JSON_COLS,
-                bundle.payment_invoice_allocations,
-                chunk,
-            )
+            _insert_qbo_bundle(cur, bundle, chunk)
             finished = datetime.now(timezone.utc)
             cur.execute(
                 """

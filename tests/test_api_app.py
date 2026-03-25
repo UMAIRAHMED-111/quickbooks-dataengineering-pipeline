@@ -1,10 +1,10 @@
-import sys
 from pathlib import Path
 
 import pytest
 
-_SRC = Path(__file__).resolve().parent.parent / "src"
-sys.path.insert(0, str(_SRC))
+from repo_bootstrap import configure_for_checkout
+
+configure_for_checkout(Path(__file__))
 
 from qbo_pipeline.web.app import create_app
 
@@ -87,11 +87,38 @@ def test_qa_503_without_config(client):
     assert body["error"] == "service_unavailable"
 
 
+def test_qa_forwards_context_to_answer_question(client, monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost/db")
+    monkeypatch.setenv("OPENAI_API_KEY_1", "fake-key")
+    captured: dict = {}
+
+    def fake_answer(cfg, question, *, context=None):
+        captured["question"] = question
+        captured["context"] = context
+        return "Ack."
+
+    monkeypatch.setattr("qbo_pipeline.web.app.answer_question", fake_answer)
+    r = client.post(
+        "/api/v1/qa",
+        json={
+            "question": "And last month?",
+            "context": [
+                {"role": "user", "content": "Payments this month?"},
+                {"role": "assistant", "content": "$100"},
+            ],
+        },
+    )
+    assert r.status_code == 200
+    assert captured["question"] == "And last month?"
+    assert captured["context"] is not None
+    assert len(captured["context"]) == 2
+
+
 def test_qa_200_mocked(client, monkeypatch):
     monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost/db")
     monkeypatch.setenv("OPENAI_API_KEY_1", "fake-openai-key-for-test")
 
-    def fake_answer(cfg, question):
+    def fake_answer(cfg, question, *, context=None):
         assert "unpaid" in question
         return "There are 3 unpaid invoices."
 

@@ -2,6 +2,8 @@
 
 Loads n8n webhook JSON into Supabase (customers, invoices, payments).
 
+**Business overview (flow, dashboard, chat):** **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
+
 1. Run `supabase/migrations/001_init.sql` in the Supabase SQL editor.
 2. Copy `.env.example` to `.env`. Set **`DATABASE_URL`** (or **`SUPABASE_DB_URL`**) and **`N8N_WEBHOOK_URL`**.
 3. In the project folder:
@@ -47,6 +49,8 @@ python server.py
 
 **Refresh warehouse data:** `POST /api/v1/sync` runs the same pipeline as `python main.py` (`run_sync`: n8n webhook → full replace in Postgres). Needs **`N8N_WEBHOOK_URL`** and DB env. Optional JSON body `{"local_file": "data/response.json"}` or query `?local_file=...` to skip HTTP. If **`SYNC_API_SECRET`** is set, send **`X-Sync-Token`** or **`Authorization: Bearer <secret>`**.
 
+**Conversation context (context window):** Optional JSON field **`context`**: array of `{"role": "user"|"assistant", "content": "..."}` (most recent turns at the end). The server trims to **`WAREHOUSE_QA_CONTEXT_MAX_CHARS`** (default 12000) and **`WAREHOUSE_QA_CONTEXT_MAX_MESSAGES`** (default 24), dropping **oldest** messages first so prompts stay within the LLM’s usable window. Prior turns are **not** treated as ground truth—answers must still come from the warehouse snapshot / SQL result.
+
 **Ask the warehouse (HTTP):** `POST /api/v1/qa` with JSON `{"question": "…"}` returns structured JSON: **`answer`** (raw LLM text, same as CLI), plus **`display`** with **`markdown`** (render-friendly), **`headline`**, **`bullets`**, and **`paragraphs`** for UI layout. Same backend as **`python ask.py`** (OpenAI **gpt-4** by default, then **Gemini** fallback; optional **`WAREHOUSE_QA_DYNAMIC_SQL=1`**). Needs at least one LLM key and **`DATABASE_URL`**. Errors: **400** / **503** / **502** / **500** as before.
 
 | Endpoint | Use |
@@ -66,7 +70,5 @@ python server.py
 | `POST /api/v1/qa` | Natural-language Q&A over the warehouse (`question` → `answer`) |
 
 Implementation: [`src/qbo_pipeline/warehouse/analytics_queries.py`](src/qbo_pipeline/warehouse/analytics_queries.py), [`src/qbo_pipeline/web/app.py`](src/qbo_pipeline/web/app.py), [`server.py`](server.py). Optional env: **`PORT`** (default 5050), **`FLASK_HOST`**, **`FLASK_DEBUG`**, **`SYNC_API_SECRET`**.
-
-**Frontend:** See **[FRONTEND.md](FRONTEND.md)** for business context, API→chart mapping, and required stack (**shadcn/ui** + **Recharts**, white/black theme).
 
 Airflow / scripts: `from qbo_pipeline import run_sync` (or `from qbo_pipeline.etl.pipeline import run_sync`) and `run_sync(Settings.from_env())`.

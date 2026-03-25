@@ -15,6 +15,7 @@ from openai import APIError as OpenAIAPIError
 from qbo_pipeline.config import Settings, WarehouseQaConfig
 from qbo_pipeline.etl.pipeline import run_sync
 from qbo_pipeline.qa.answer_structure import structure_qa_response
+from qbo_pipeline.qa.context_window import normalize_context_turns
 from qbo_pipeline.qa.warehouse_qa import answer_question
 from qbo_pipeline.warehouse import analytics_queries as aq
 
@@ -93,14 +94,14 @@ def create_app() -> Flask:
     def warehouse_qa():
         """
         Natural-language Q&A over the loaded warehouse (same logic as `python ask.py`).
-        JSON: question, answer (raw LLM text), display (markdown, headline, bullets, paragraphs).
+        JSON: question, optional context (conversation window), answer + display.
         """
         if not request.is_json or request.json is None:
             return (
                 jsonify(
                     {
                         "error": "invalid_request",
-                        "detail": "Send JSON: {\"question\": \"...\"}",
+                        "detail": 'Send JSON: {"question": "..."} optional "context": [{"role":"user|assistant","content":"..."}]',
                     }
                 ),
                 400,
@@ -121,8 +122,13 @@ def create_app() -> Flask:
             cfg = WarehouseQaConfig.from_env()
         except RuntimeError as exc:
             return jsonify({"error": "service_unavailable", "detail": str(exc)}), 503
+        ctx_turns = normalize_context_turns(request.json.get("context"))
         try:
-            answer = answer_question(cfg, question)
+            answer = answer_question(
+                cfg,
+                question,
+                context=ctx_turns if ctx_turns else None,
+            )
         except (GeminiAPIError, OpenAIAPIError) as exc:
             code = getattr(exc, "code", None)
             if code is None:
