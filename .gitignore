@@ -15,3 +15,5 @@ dist/
 .vscode/
 *.swp
 *.swo
+
+.cursor/
