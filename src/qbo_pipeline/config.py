@@ -23,6 +23,8 @@ class Settings:
     supabase_database_url: str
     n8n_http_timeout_seconds: float
     supabase_insert_chunk_size: int
+    n8n_basic_auth_username: str | None = None
+    n8n_basic_auth_password: str | None = None
 
     @staticmethod
     def from_env() -> Settings:
@@ -31,11 +33,20 @@ class Settings:
             raise RuntimeError(
                 "Set SUPABASE_DB_URL or DATABASE_URL to your Postgres connection URI"
             )
+        n8n_user = (os.getenv("N8N_BASIC_AUTH_USERNAME") or "").strip() or None
+        n8n_pass = (os.getenv("N8N_BASIC_AUTH_PASSWORD") or "").strip() or None
+        if (n8n_user is None) != (n8n_pass is None):
+            raise RuntimeError(
+                "Set both N8N_BASIC_AUTH_USERNAME and N8N_BASIC_AUTH_PASSWORD "
+                "(or neither) for n8n webhook basic auth"
+            )
         return Settings(
             n8n_webhook_url=_require("N8N_WEBHOOK_URL"),
             supabase_database_url=db,
             n8n_http_timeout_seconds=float(os.getenv("N8N_HTTP_TIMEOUT_SECONDS", "120")),
             supabase_insert_chunk_size=int(os.getenv("SUPABASE_INSERT_CHUNK_SIZE", "500")),
+            n8n_basic_auth_username=n8n_user,
+            n8n_basic_auth_password=n8n_pass,
         )
 
 

@@ -45,24 +45,40 @@ def test_sync_401_when_secret_configured(client, monkeypatch):
     assert r.status_code == 401
 
 
-def test_sync_invokes_run_sync_when_authed(client, monkeypatch):
+def test_sync_invokes_background_sync_when_authed(client, monkeypatch):
     monkeypatch.setenv("SYNC_API_SECRET", "expected-token")
     monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost/db")
     monkeypatch.setenv("N8N_WEBHOOK_URL", "http://example.invalid/webhook")
-    called: list = []
+    called: dict = {}
 
-    def fake_run_sync(settings, local_path=None):
-        called.append(local_path)
+    def fake_start_sync_run(settings):
+        called["started"] = True
         return "sync-uuid-123"
 
-    monkeypatch.setattr("qbo_pipeline.web.app.run_sync", fake_run_sync)
+    def fake_continue_sync_run(settings, sync_id, *, local_path=None):
+        called["continued_sync_id"] = sync_id
+        called["local_path"] = local_path
+
+    def fake_schedule(job, *, sync_id):
+        called["scheduled_sync_id"] = sync_id
+        job()
+
+    monkeypatch.setattr("qbo_pipeline.web.app.start_sync_run", fake_start_sync_run)
+    monkeypatch.setattr(
+        "qbo_pipeline.web.app.continue_sync_run",
+        fake_continue_sync_run,
+    )
+    monkeypatch.setattr("qbo_pipeline.web.app._schedule_background_sync", fake_schedule)
     r = client.post(
         "/api/v1/sync",
         headers={"Authorization": "Bearer expected-token"},
     )
-    assert r.status_code == 200
+    assert r.status_code == 202
     assert r.get_json()["sync_run_id"] == "sync-uuid-123"
-    assert called == [None]
+    assert called["started"] is True
+    assert called["scheduled_sync_id"] == "sync-uuid-123"
+    assert called["continued_sync_id"] == "sync-uuid-123"
+    assert called["local_path"] is None
 
 
 def test_qa_400_empty_question(client):
@@ -139,14 +155,31 @@ def test_qa_200_mocked(client, monkeypatch):
 def test_sync_local_file_json_body(client, monkeypatch):
     monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@localhost/db")
     monkeypatch.setenv("N8N_WEBHOOK_URL", "http://example.invalid/webhook")
+    called: dict = {}
 
-    def fake_run_sync(settings, local_path=None):
-        return f"path:{local_path}"
+    def fake_start_sync_run(settings):
+        return "sync-uuid-456"
 
-    monkeypatch.setattr("qbo_pipeline.web.app.run_sync", fake_run_sync)
+    def fake_continue_sync_run(settings, sync_id, *, local_path=None):
+        called["sync_id"] = sync_id
+        called["local_path"] = local_path
+
+    def fake_schedule(job, *, sync_id):
+        called["scheduled_sync_id"] = sync_id
+        job()
+
+    monkeypatch.setattr("qbo_pipeline.web.app.start_sync_run", fake_start_sync_run)
+    monkeypatch.setattr(
+        "qbo_pipeline.web.app.continue_sync_run",
+        fake_continue_sync_run,
+    )
+    monkeypatch.setattr("qbo_pipeline.web.app._schedule_background_sync", fake_schedule)
     r = client.post(
         "/api/v1/sync",
         json={"local_file": "data/sample.json"},
     )
-    assert r.status_code == 200
-    assert r.get_json()["sync_run_id"] == "path:data/sample.json"
+    assert r.status_code == 202
+    assert r.get_json()["sync_run_id"] == "sync-uuid-456"
+    assert called["scheduled_sync_id"] == "sync-uuid-456"
+    assert called["sync_id"] == "sync-uuid-456"
+    assert called["local_path"] == "data/sample.json"

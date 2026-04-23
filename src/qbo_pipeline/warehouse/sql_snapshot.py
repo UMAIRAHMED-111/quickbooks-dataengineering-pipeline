@@ -5,10 +5,12 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable
 from typing import Any
 
-import psycopg2
+from qbo_pipeline.db.pool import pooled_connection
+from qbo_pipeline.observability import get_logger
 
 Cursor = Any
 PackFn = Callable[[Cursor], list[str]]
+logger = get_logger(__name__)
 
 # Order preserved when merging multiple packs for stable, readable summaries.
 PACK_ORDER: tuple[str, ...] = (
@@ -240,17 +242,26 @@ def fetch_warehouse_summary(
         wanted = frozenset(pack_ids) & ALL_PACK_IDS
         if not wanted:
             wanted = ALL_PACK_IDS
+    logger.info(
+        "warehouse_snapshot_fetch_started",
+        selected_pack_count=len(wanted),
+        selected_packs=",".join(sorted(wanted)),
+    )
 
-    conn = psycopg2.connect(database_url)
-    try:
+    with pooled_connection(database_url) as conn:
         with conn.cursor() as cur:
             lines: list[str] = ["## Warehouse summary (exact SQL)\n"]
             for pid in PACK_ORDER:
                 if pid in wanted:
+                    logger.info("warehouse_snapshot_pack_started", pack_id=pid)
                     chunk = _PACK_REGISTRY[pid](cur)
                     if chunk:
                         lines.extend(chunk)
-    finally:
-        conn.close()
+                    logger.info(
+                        "warehouse_snapshot_pack_completed",
+                        pack_id=pid,
+                        line_count=len(chunk),
+                    )
 
+    logger.info("warehouse_snapshot_fetch_completed")
     return "\n".join(lines)

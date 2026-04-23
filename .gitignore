@@ -17,3 +17,4 @@ dist/
 *.swo
 
 .cursor/
+.cursorignore

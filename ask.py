@@ -9,8 +9,10 @@ from repo_bootstrap import configure_for_checkout
 
 configure_for_checkout(Path(__file__))
 
+from qbo_pipeline.observability import configure_logging  # noqa: E402
 from qbo_pipeline.qa.warehouse_qa import main  # noqa: E402
 
+configure_logging(service="qbo_pipeline_qa_cli")
 
 if __name__ == "__main__":
     raise SystemExit(main(sys.argv[1:]))

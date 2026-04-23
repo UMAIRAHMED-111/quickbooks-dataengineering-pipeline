@@ -1,74 +1,351 @@
-# QuickBooks → Supabase
+# QuickBooks Data Engineering Pipeline
 
-Loads n8n webhook JSON into Supabase (customers, invoices, payments).
+Production-oriented QuickBooks analytics platform built on Python + Supabase Postgres, with:
 
-**Business overview (flow, dashboard, chat):** **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
+- deterministic ETL (`extract -> transform -> validate -> load`)
+- async API-triggered sync runs
+- analytics endpoints for dashboards
+- natural-language warehouse Q&A (OpenAI primary, Gemini fallback)
+- Airflow DAG orchestration option
 
-1. Run `supabase/migrations/001_init.sql` in the Supabase SQL editor.
-2. Copy `.env.example` to `.env`. Set **`DATABASE_URL`** (or **`SUPABASE_DB_URL`**) and **`N8N_WEBHOOK_URL`**.
-3. In the project folder:
+---
 
-   ```bash
-   pip install -r requirements.txt
-   python main.py
-   ```
+## 1) What This Repository Contains
 
-Use `python main.py --local-file data/response.json` to read a file instead of the webhook.
+- `src/qbo_pipeline/etl`: core data pipeline logic and CLI runtime
+- `src/qbo_pipeline/db`: shared Postgres connection pooling
+- `src/qbo_pipeline/warehouse`: fixed analytics SQL and snapshot packs
+- `src/qbo_pipeline/qa`: Q&A orchestration, prompt logic, dynamic SQL guardrails
+- `src/qbo_pipeline/web`: Flask API endpoints
+- `airflow/dags`: DAG for scheduled orchestration
+- `supabase/migrations`: DDL and schema evolution for warehouse tables
+- `tests`: unit/integration-style tests for ETL, API, and QA behavior
+- `main.py`, `server.py`, `ask.py`: runnable entrypoints
 
-**Invoice “email sent” (`is_email_sent`):** Derived from QBO **`EmailStatus`**. By default **`Sent`**, **`EmailSent`**, and **`NeedToSend`** count as sent (case-insensitive)—**`NeedToSend`** matches invoices queued for email (e.g. with **`DeliveryInfo.DeliveryType: Email`**). To use only “actually sent in QBO,” set **`QBO_IS_EMAIL_SENT_STATUSES=Sent,EmailSent`**. **Important:** **`NotSet`** usually means QBO has no email-send state; external-only email may not update **`EmailStatus`**. After changing env, run **`python main.py`** again to reload.
+---
 
-**Ask (English Q&A):** set **`OPENAI_API_KEY_1`** (and optionally **`OPENAI_API_KEY_2`** as a second key); each request tries key 1, then key 2, then **`GEMINI_API_KEY`** (or **`GOOGLE_API_KEY`**) as fallback. Default OpenAI model is **`gpt-4`** (`OPENAI_MODEL`). Sync data, then:
+## 2) High-Level Architecture
+
+```text
+QuickBooks (via n8n webhook)
+  -> ETL Extract (HTTP/local file)
+  -> Transform (canonical rows + relationships)
+  -> Validate (technical + business checks)
+  -> Load (transactional upsert into Postgres)
+  -> Analytics API + Q&A over curated warehouse
+```
+
+### Sync execution modes
+
+- CLI sync: `python main.py`
+- API sync: `POST /api/v1/sync` (returns `202` immediately, runs in background)
+- Airflow sync: `qbo_n8n_sync` DAG
+
+---
+
+## 3) Data Model and Warehouse Schema
+
+Schema is managed by:
+
+- `supabase/migrations/001_init.sql`
+- `supabase/migrations/002_sync_runs_upsert_counters.sql`
+
+### Core tables
+
+- `public.sync_runs`: run lifecycle (`running/success/failed`) and per-run counters
+- `public.customers`: normalized customer entities keyed by `qbo_id`
+- `public.invoices`: invoice facts linked to customers
+- `public.payments`: payment facts linked to customers
+- `public.payment_invoice_allocations`: payment-to-invoice allocations
+
+### Key guarantees
+
+- Upsert strategy by `qbo_id` for idempotent reruns
+- FK-enforced relationships across entities
+- freshness-aware update logic via `qbo_last_updated_time`
+- per-run observability via `sync_runs` + logs
+
+---
+
+## 4) ETL Workflow (Detailed)
+
+Implemented in `src/qbo_pipeline/etl`.
+
+1. **Extract**
+   - Source: `N8N_WEBHOOK_URL` (or local JSON file)
+   - Retries for transient HTTP failures (`408/429/5xx`) with backoff
+2. **Transform**
+   - Converts QuickBooks payloads into canonical warehouse rows
+   - Creates stable relationship maps and allocation links
+   - Normalizes types (dates/timestamps/numerics/bools)
+3. **Validate**
+   - Required fields/types, duplicate checks, referential integrity
+   - business checks (non-negative amounts, date constraints, allocation consistency)
+4. **Load**
+   - Transactional upsert across all entities
+   - run status/counters persisted in `sync_runs`
+   - failure path marks run `failed` with error message
+
+---
+
+## 5) API Layer
+
+Implemented in `src/qbo_pipeline/web/app.py`; entrypoint `python server.py`.
+
+### Endpoints
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /health` | Service health check |
+| `POST /api/v1/sync` | Queue ETL sync; returns `202` and `sync_run_id` |
+| `POST /api/v1/qa` | Ask warehouse in natural language |
+| `GET /api/v1/metrics/catalog` | List metric endpoints |
+| `GET /api/v1/metrics/overview` | Top-level KPI summary |
+| `GET /api/v1/metrics/invoices/paid-vs-unpaid` | Paid/unpaid invoice stats |
+| `GET /api/v1/metrics/invoices/sent-vs-unsent` | Email sent status buckets |
+| `GET /api/v1/metrics/invoices/overdue-vs-current` | Overdue vs current unpaid |
+| `GET /api/v1/metrics/invoices/paid-on-time-vs-late` | Settlement timing |
+| `GET /api/v1/metrics/customers/top-paying?limit=10` | Highest payment customers |
+| `GET /api/v1/metrics/customers/top-outstanding?limit=10` | Highest outstanding balances |
+| `GET /api/v1/metrics/customers/top-overdue-debt?limit=10` | Largest past-due debtors |
+| `GET /api/v1/metrics/customers/best-on-time-payers?limit=10` | Best on-time payers |
+| `GET /api/v1/metrics/payments/by-month` | Monthly payment series |
+| `GET /api/v1/metrics/allocations/summary` | Allocation coverage summary |
+
+### Error model (current)
+
+- `400` invalid request payload
+- `401` unauthorized sync trigger (when `SYNC_API_SECRET` set)
+- `500` internal failures (`database_error`, `sync_failed`, `qa_failed`)
+- `502` upstream LLM/provider issue (`llm_error`)
+- `503` missing required runtime configuration (`service_unavailable`)
+
+---
+
+## 6) Q&A Subsystem
+
+Implemented in `src/qbo_pipeline/qa/warehouse_qa.py`.
+
+### Two answer paths
+
+- **Snapshot path (default)**:
+  - planner selects SQL packs from `warehouse/sql_snapshot.py`
+  - LLM answers using precomputed summary text
+- **Dynamic SQL path (optional)**:
+  - enabled with `WAREHOUSE_QA_DYNAMIC_SQL=1`
+  - LLM proposes one SELECT
+  - SQL validated with strict read-only guardrails in `qa/dynamic_sql.py`
+  - query executed with row/timeout limits
+  - on non-provider failure, safely falls back to snapshot packs
+
+### Guardrails
+
+- allowlisted tables only
+- read-only SQL AST validation
+- statement timeout
+- row cap (`MAX_ROWS_RETURNED`)
+- strict response shaping for API display
+
+---
+
+## 7) Observability and Logging
+
+Shared logging utility: `src/qbo_pipeline/observability.py`.
+
+- single reusable logger API via `get_logger(...)`
+- one-time bootstrap via `configure_logging(service=...)`
+- structured event-style logs across ETL/API/QA/warehouse layers
+- workflow trace fields include:
+  - `sync_run_id`
+  - stage boundaries (`*_started`, `*_completed`, `*_failed`)
+  - row/entity counts and selected pack/query metadata
+
+Runtime level can be controlled with `LOG_LEVEL` (default `INFO`).
+
+---
+
+## 8) Airflow Orchestration
+
+DAG file: `airflow/dags/qbo_n8n_sync_dag.py`.
+
+- task sequence:
+  - `fetch_n8n_json`
+  - `warehouse_delete` (starts `sync_runs` record)
+  - `warehouse_insert` (transform + validated upsert)
+- retries configured
+- task timeout and dagrun timeout configured
+- catchup disabled (`catchup=False`)
+- payload handoff uses temp file path (avoids large XCom payloads)
+
+---
+
+## 9) Configuration Reference
+
+Create a `.env` manually in repo root (no `.env.example` is currently checked in).
+
+### Required for ETL/API sync
+
+- `DATABASE_URL` or `SUPABASE_DB_URL`
+- `N8N_WEBHOOK_URL`
+
+### Optional ETL
+
+- `N8N_BASIC_AUTH_USERNAME`
+- `N8N_BASIC_AUTH_PASSWORD`
+- `N8N_HTTP_TIMEOUT_SECONDS` (default `120`)
+- `SUPABASE_INSERT_CHUNK_SIZE` (default `500`)
+- `QBO_IS_EMAIL_SENT_STATUSES` (default `Sent,EmailSent,NeedToSend`)
+
+### API runtime
+
+- `PORT` (default `5050`)
+- `FLASK_HOST` (default `127.0.0.1`)
+- `FLASK_DEBUG` (`1|true|yes` to enable)
+- `SYNC_API_SECRET` (protects `POST /api/v1/sync`)
+
+### Q&A required (at least one provider key)
+
+- `OPENAI_API_KEY_1` (primary)
+- `OPENAI_API_KEY_2` (optional secondary)
+- `GEMINI_API_KEY` or `GOOGLE_API_KEY` (fallback)
+
+### Q&A tuning
+
+- `OPENAI_MODEL`, `OPENAI_PLANNER_MODEL`, `OPENAI_SQL_MODEL`
+- `GEMINI_MODEL`, `GEMINI_PLANNER_MODEL`, `GEMINI_SQL_MODEL`
+- `WAREHOUSE_QA_DYNAMIC_SQL` (`1` enables dynamic SQL path)
+- `WAREHOUSE_QA_NO_PLANNER` (`1` disables snapshot planner)
+- `WAREHOUSE_QA_CONTEXT_MAX_CHARS` (default `12000`)
+- `WAREHOUSE_QA_CONTEXT_MAX_MESSAGES` (default `24`)
+- `WAREHOUSE_QA_VERBOSE` (extra fallback traceback logging)
+- `GEMINI_MAX_RETRIES` (429 retry behavior in Gemini path)
+
+### Logging
+
+- `LOG_LEVEL` (`DEBUG|INFO|WARNING|ERROR`, default `INFO`)
+
+---
+
+## 10) Local Development
+
+### Install
+
+```bash
+pip install -r requirements.txt
+```
+
+Optional editable install:
+
+```bash
+pip install -e .
+```
+
+Optional extras from `pyproject.toml`:
+
+- dev: `pip install -e ".[dev]"`
+- airflow: `pip install -e ".[airflow]"`
+
+### Apply DB migrations
+
+Run SQL files in order against Supabase/Postgres:
+
+1. `supabase/migrations/001_init.sql`
+2. `supabase/migrations/002_sync_runs_upsert_counters.sql`
+
+### Run sync (CLI)
+
+```bash
+python main.py
+python main.py --local-file data/response.json
+```
+
+### Run API
+
+```bash
+python server.py
+```
+
+### Run Q&A CLI
 
 ```bash
 python ask.py "How many unpaid invoices do we have and who owes the most?"
 ```
 
-After `pip install -e .`, you can use `python -m qbo_pipeline.qa.warehouse_qa "..."` instead.
+---
 
-**Package layout:** `qbo_pipeline.etl` (sync: extract / transform / load), `qbo_pipeline.warehouse` (SQL snapshots + analytics queries), `qbo_pipeline.qa` (OpenAI → Gemini LLM Q&A + dynamic SQL validation), `qbo_pipeline.web` (Flask API), and **`config.py`** at the package root.
+## 11) Test Strategy
 
-**Dynamic SQL is off by default.** Turn it on with **`WAREHOUSE_QA_DYNAMIC_SQL=1`** in `.env`. Then the LLM (**OpenAI first**, then **Gemini**) proposes one **SELECT**; the app validates it (read-only, **[allowlisted tables](src/qbo_pipeline/qa/dynamic_sql.py)** only), runs it, and answers from the **real result set**. On validation/DB errors it **falls back** to snapshot packs (a line is printed to **stderr** so you know). Optional **`OPENAI_SQL_MODEL`** / **`GEMINI_SQL_MODEL`**. **`WAREHOUSE_QA_VERBOSE=1`** adds a full traceback on fallback.
+Test suite path: `tests/`.
 
-**Preset packs (default when dynamic SQL is off):** a **planning call** picks which fixed SQL packs to run, then the **answer call** sees that snapshot. Set **`WAREHOUSE_QA_NO_PLANNER=1`** for one LLM call with the full snapshot. Optional **`OPENAI_PLANNER_MODEL`** / **`GEMINI_PLANNER_MODEL`**. No embeddings or vector DB.
+Covers:
 
-Test questions and matching **verification SQL**: [docs/warehouse_qa_verification.md](docs/warehouse_qa_verification.md).
+- transform behavior and edge cases
+- API endpoint contracts
+- dynamic SQL validation/execution guards
+- Q&A answer shaping and context handling
+- fallback/retry behavior
 
-**Gemini fallback** **retries** HTTP **429** (default **3** extra attempts via **`GEMINI_MAX_RETRIES`**) with backoff when the request reaches Gemini. OpenAI errors on key 1 move to key 2, then Gemini.
-
-Default **OpenAI** chat model is **`gpt-4`** (`OPENAI_MODEL`). Default **Gemini** fallback is **`gemini-2.5-flash-lite`** (`GEMINI_MODEL`). If you see **429** on Gemini, check [rate limits](https://ai.google.dev/gemini-api/docs/rate-limits)—planning uses two LLM requests when enabled.
-
-## Analytics API (graphs / dashboards)
-
-JSON endpoints over **`DATABASE_URL`** / **`SUPABASE_DB_URL`** for chart-friendly aggregates (CORS enabled for local frontends).
+Run tests:
 
 ```bash
-python server.py
-# → http://127.0.0.1:5050/health
-# List routes: GET /api/v1/metrics/catalog
+python -m pytest -q
 ```
 
-**Refresh warehouse data:** `POST /api/v1/sync` runs the same pipeline as `python main.py` (`run_sync`: n8n webhook → full replace in Postgres). Needs **`N8N_WEBHOOK_URL`** and DB env. Optional JSON body `{"local_file": "data/response.json"}` or query `?local_file=...` to skip HTTP. If **`SYNC_API_SECRET`** is set, send **`X-Sync-Token`** or **`Authorization: Bearer <secret>`**.
+---
 
-**Conversation context (context window):** Optional JSON field **`context`**: array of `{"role": "user"|"assistant", "content": "..."}` (most recent turns at the end). The server trims to **`WAREHOUSE_QA_CONTEXT_MAX_CHARS`** (default 12000) and **`WAREHOUSE_QA_CONTEXT_MAX_MESSAGES`** (default 24), dropping **oldest** messages first so prompts stay within the LLM’s usable window. Prior turns are **not** treated as ground truth—answers must still come from the warehouse snapshot / SQL result.
+## 12) Repo Tree (Primary Files)
 
-**Ask the warehouse (HTTP):** `POST /api/v1/qa` with JSON `{"question": "…"}` returns structured JSON: **`answer`** (raw LLM text, same as CLI), plus **`display`** with **`markdown`** (render-friendly), **`headline`**, **`bullets`**, and **`paragraphs`** for UI layout. Same backend as **`python ask.py`** (OpenAI **gpt-4** by default, then **Gemini** fallback; optional **`WAREHOUSE_QA_DYNAMIC_SQL=1`**). Needs at least one LLM key and **`DATABASE_URL`**. Errors: **400** / **503** / **502** / **500** as before.
+```text
+.
+├── airflow/dags/qbo_n8n_sync_dag.py
+├── supabase/migrations/
+│   ├── 001_init.sql
+│   └── 002_sync_runs_upsert_counters.sql
+├── src/qbo_pipeline/
+│   ├── __init__.py
+│   ├── config.py
+│   ├── observability.py
+│   ├── db/pool.py
+│   ├── etl/
+│   │   ├── extract.py
+│   │   ├── transform.py
+│   │   ├── validate.py
+│   │   ├── load.py
+│   │   ├── pipeline.py
+│   │   └── run.py
+│   ├── warehouse/
+│   │   ├── analytics_queries.py
+│   │   └── sql_snapshot.py
+│   ├── qa/
+│   │   ├── warehouse_qa.py
+│   │   ├── dynamic_sql.py
+│   │   ├── llm_complete.py
+│   │   ├── answer_structure.py
+│   │   ├── context_window.py
+│   │   ├── gemini_retry.py
+│   │   └── small_talk.py
+│   └── web/app.py
+├── tests/
+├── main.py
+├── server.py
+├── ask.py
+├── requirements.txt
+└── pyproject.toml
+```
 
-| Endpoint | Use |
-|----------|-----|
-| `GET /api/v1/metrics/overview` | Counts, total outstanding, invoiced, payments |
-| `GET /api/v1/metrics/invoices/paid-vs-unpaid` | Paid vs unpaid counts & amounts |
-| `GET /api/v1/metrics/invoices/sent-vs-unsent` | `is_email_sent` buckets |
-| `GET /api/v1/metrics/invoices/overdue-vs-current` | Past-due unpaid vs not-yet-due unpaid |
-| `GET /api/v1/metrics/invoices/paid-on-time-vs-late` | Settled invoices: on-time vs late vs unknown |
-| `GET /api/v1/metrics/customers/top-paying?limit=10` | Highest payment totals |
-| `GET /api/v1/metrics/customers/top-outstanding?limit=10` | Largest customer balances |
-| `GET /api/v1/metrics/customers/top-overdue-debt?limit=10` | Biggest **past-due** open AR |
-| `GET /api/v1/metrics/customers/best-on-time-payers?limit=10` | Most on-time **paid** invoices per customer |
-| `GET /api/v1/metrics/payments/by-month` | Payment totals by calendar month |
-| `GET /api/v1/metrics/allocations/summary` | Allocation counts & sums |
-| `POST /api/v1/sync` | Run ETL sync (webhook or `local_file`) |
-| `POST /api/v1/qa` | Natural-language Q&A over the warehouse (`question` → `answer`) |
+---
 
-Implementation: [`src/qbo_pipeline/warehouse/analytics_queries.py`](src/qbo_pipeline/warehouse/analytics_queries.py), [`src/qbo_pipeline/web/app.py`](src/qbo_pipeline/web/app.py), [`server.py`](server.py). Optional env: **`PORT`** (default 5050), **`FLASK_HOST`**, **`FLASK_DEBUG`**, **`SYNC_API_SECRET`**.
+## 13) Production Readiness Notes
 
-Airflow / scripts: `from qbo_pipeline import run_sync` (or `from qbo_pipeline.etl.pipeline import run_sync`) and `run_sync(Settings.from_env())`.
+- Database writes are transactional and idempotent by `qbo_id`.
+- Sync lifecycle is traceable in `sync_runs`.
+- API sync trigger is async (`202` + background worker).
+- SQL generation path is guarded and optional.
+- Structured logs are emitted across all critical stages.
+
+Recommended next production steps:
+
+- add deployment manifests and infrastructure docs
+- add runbook/SLO/alerting documentation
+- add CI pipeline for lint/test/migration checks
+- add secrets management policy (vault/provider-based)

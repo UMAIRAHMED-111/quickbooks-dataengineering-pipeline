@@ -1,4 +1,4 @@
--- QuickBooks → analytics warehouse (single company). Full replace each run: delete customers cascades all children.
+-- QuickBooks → analytics warehouse (single company). Incremental upsert each run.
 
 create extension if not exists "pgcrypto";
 
@@ -87,6 +87,6 @@ create table if not exists public.payment_invoice_allocations (
 create index if not exists payment_invoice_allocations_invoice_id_idx
   on public.payment_invoice_allocations (invoice_id);
 
-comment on table public.customers is 'QuickBooks customers; full replace each pipeline run.';
+comment on table public.customers is 'QuickBooks customers; incremental upsert each pipeline run.';
 comment on table public.invoices is 'is_email_sent: QBO EmailStatus in Sent, EmailSent, NeedToSend by default; override QBO_IS_EMAIL_SENT_STATUSES.';
 comment on table public.payment_invoice_allocations is 'Links payments to invoices for on-time payment analysis.';

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from threading import Thread
 from functools import wraps
 from typing import Any, Callable
 
@@ -13,11 +14,14 @@ from google.genai.errors import APIError as GeminiAPIError
 from openai import APIError as OpenAIAPIError
 
 from qbo_pipeline.config import Settings, WarehouseQaConfig
-from qbo_pipeline.etl.pipeline import run_sync
+from qbo_pipeline.etl.pipeline import continue_sync_run, start_sync_run
+from qbo_pipeline.observability import get_logger
 from qbo_pipeline.qa.answer_structure import structure_qa_response
 from qbo_pipeline.qa.context_window import normalize_context_turns
 from qbo_pipeline.qa.warehouse_qa import answer_question
 from qbo_pipeline.warehouse import analytics_queries as aq
+
+logger = get_logger(__name__)
 
 
 def _database_url() -> str:
@@ -38,8 +42,9 @@ def _handle_db(fn: Callable[..., Any]):
             return jsonify({"error": str(exc)}), 503
         try:
             return fn(url, *args, **kwargs)
-        except psycopg2.Error as exc:
-            return jsonify({"error": "database_error", "detail": str(exc)}), 500
+        except psycopg2.Error:
+            logger.exception("database_query_failed")
+            return jsonify({"error": "database_error"}), 500
 
     return wrapper
 
@@ -58,6 +63,15 @@ def _sync_auth_error():
     return None
 
 
+def _schedule_background_sync(job: Callable[[], None], *, sync_id: str) -> None:
+    worker = Thread(
+        target=job,
+        name=f"qbo-sync-{sync_id}",
+        daemon=True,
+    )
+    worker.start()
+
+
 def create_app() -> Flask:
     app = Flask(__name__)
     CORS(app, resources={r"/api/*": {"origins": "*"}})
@@ -69,7 +83,7 @@ def create_app() -> Flask:
     @app.post("/api/v1/sync")
     def trigger_sync():
         """
-        Run full replace sync: webhook (or optional local_file JSON body / query).
+        Queue a sync run and return immediately (webhook or optional local_file JSON body / query).
         JSON body: {"local_file": "path/to.json"} optional.
         """
         auth_err = _sync_auth_error()
@@ -85,10 +99,20 @@ def create_app() -> Flask:
         if not local_file:
             local_file = request.args.get("local_file")
         try:
-            sync_id = run_sync(settings, local_path=local_file)
-        except Exception as exc:
-            return jsonify({"error": "sync_failed", "detail": str(exc)}), 500
-        return jsonify({"sync_run_id": str(sync_id), "status": "success"}), 200
+            sync_id = start_sync_run(settings)
+        except Exception:
+            logger.exception("sync_start_failed")
+            return jsonify({"error": "sync_failed"}), 500
+
+        def _run_sync_job() -> None:
+            try:
+                continue_sync_run(settings, sync_id, local_path=local_file)
+            except Exception:
+                logger.exception("api_sync_background_job_failed", sync_run_id=sync_id)
+
+        _schedule_background_sync(_run_sync_job, sync_id=sync_id)
+        logger.info("api_sync_accepted", sync_run_id=sync_id)
+        return jsonify({"sync_run_id": str(sync_id), "status": "accepted"}), 202
 
     @app.post("/api/v1/qa")
     def warehouse_qa():
@@ -130,18 +154,20 @@ def create_app() -> Flask:
                 context=ctx_turns if ctx_turns else None,
             )
         except (GeminiAPIError, OpenAIAPIError) as exc:
+            logger.exception("warehouse_qa_llm_error")
             code = getattr(exc, "code", None)
             if code is None:
                 code = getattr(exc, "status_code", None)
             payload: dict[str, Any] = {
                 "error": "llm_error",
-                "detail": str(exc),
+                "detail": "LLM provider error. Retry or try again later.",
             }
             if code is not None:
                 payload["code"] = code
             return jsonify(payload), 502
-        except Exception as exc:
-            return jsonify({"error": "qa_failed", "detail": str(exc)}), 500
+        except Exception:
+            logger.exception("warehouse_qa_failed")
+            return jsonify({"error": "qa_failed"}), 500
         return jsonify(structure_qa_response(question=question, answer=answer)), 200
 
     @app.get("/api/v1/metrics/overview")

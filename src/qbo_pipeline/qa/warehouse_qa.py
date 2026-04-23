@@ -11,6 +11,7 @@ import sys
 from google.genai.errors import APIError
 
 from qbo_pipeline.config import WarehouseQaConfig
+from qbo_pipeline.observability import configure_logging, get_logger
 from qbo_pipeline.qa.context_window import build_context_prefix, normalize_context_turns
 from qbo_pipeline.qa.dynamic_sql import (
     SCHEMA_FOR_LLM,
@@ -25,6 +26,7 @@ from qbo_pipeline.warehouse.sql_snapshot import (
     PACK_DESCRIPTIONS,
     fetch_warehouse_summary,
 )
+logger = get_logger(__name__)
 
 _PLANNER_SYSTEM = """You pick which read-only SQL summary sections are needed to answer a QuickBooks warehouse question.
 
@@ -102,8 +104,9 @@ def _sanitize_qa_answer_text(text: str) -> str:
 
 
 def _generate_sql(cfg: WarehouseQaConfig, question: str, context_prefix: str) -> str:
+    logger.info("warehouse_qa_sql_generation_started", question_chars=len(question))
     user = f"{context_prefix}Schema:\n{SCHEMA_FOR_LLM}\n\nQuestion: {question}\n\nSQL only:"
-    return complete_qa_llm(
+    out = complete_qa_llm(
         cfg,
         task="sql_generate",
         system_instruction=_SQL_GEN_SYSTEM,
@@ -111,16 +114,23 @@ def _generate_sql(cfg: WarehouseQaConfig, question: str, context_prefix: str) ->
         temperature=0.0,
         max_output_tokens=512,
     )
+    logger.info("warehouse_qa_sql_generation_completed", sql_chars=len(out))
+    return out
 
 
 def _answer_via_dynamic_sql(
     cfg: WarehouseQaConfig, question: str, context_prefix: str
 ) -> str:
+    logger.info("warehouse_qa_dynamic_sql_path_started")
     raw = _generate_sql(cfg, question, context_prefix)
     sql = validate_readonly_select(raw)
     try:
         cols, rows, truncated = execute_validated_select(cfg.database_url, sql)
     except Exception as exc:
+        logger.warning(
+            "warehouse_qa_dynamic_sql_retry_after_db_error",
+            error=str(exc),
+        )
         err = str(exc).replace("\n", " ")[:800]
         fix_user = (
             f"{context_prefix}"
@@ -144,6 +154,12 @@ def _answer_via_dynamic_sql(
         )
         sql = validate_readonly_select(raw2)
         cols, rows, truncated = execute_validated_select(cfg.database_url, sql)
+    logger.info(
+        "warehouse_qa_dynamic_sql_result_ready",
+        column_count=len(cols),
+        row_count=len(rows),
+        truncated=truncated,
+    )
     block = format_result_for_llm(cols, rows, sql, truncated=truncated)
     user = f"{context_prefix}Question: {question}\n\n--- QUERY_RESULT ---\n{block}\n"
     out = complete_qa_llm(
@@ -164,6 +180,11 @@ def _dynamic_sql_fallback_exc(exc: Exception) -> None:
     print(
         f"Note: dynamic SQL failed ({type(exc).__name__}: {msg}); using preset snapshot packs.",
         file=sys.stderr,
+    )
+    logger.warning(
+        "warehouse_qa_dynamic_sql_fallback",
+        error_type=type(exc).__name__,
+        error=msg,
     )
     if os.getenv("WAREHOUSE_QA_VERBOSE", "").strip().lower() in (
         "1",
@@ -213,6 +234,7 @@ def _parse_pack_list(raw: str) -> frozenset[str]:
 def plan_snapshot_packs(
     cfg: WarehouseQaConfig, question: str, context_prefix: str
 ) -> frozenset[str]:
+    logger.info("warehouse_qa_snapshot_planner_started")
     catalog = _catalog_lines_for_planner()
     user = f"{context_prefix}{catalog}\n\nQuestion: {question}\n\nJSON array of pack ids only:"
     raw = complete_qa_llm(
@@ -224,7 +246,13 @@ def plan_snapshot_packs(
         max_output_tokens=256,
     )
     packs = _parse_pack_list(raw)
-    return frozenset(packs | {"counts_basic"})
+    selected = frozenset(packs | {"counts_basic"})
+    logger.info(
+        "warehouse_qa_snapshot_planner_completed",
+        selected_pack_count=len(selected),
+        selected_packs=",".join(sorted(selected)),
+    )
+    return selected
 
 
 def answer_question(
@@ -233,8 +261,10 @@ def answer_question(
     *,
     context: list[dict[str, str]] | None = None,
 ) -> str:
+    logger.info("warehouse_qa_answer_started")
     chit = try_small_talk_reply(question)
     if chit is not None:
+        logger.info("warehouse_qa_small_talk_answered")
         return chit
 
     turns = normalize_context_turns(context) if context else []
@@ -269,10 +299,12 @@ def answer_question(
         temperature=0.2,
         max_output_tokens=900,
     )
+    logger.info("warehouse_qa_answer_completed")
     return _sanitize_qa_answer_text(out)
 
 
 def main(argv: list[str] | None = None) -> int:
+    configure_logging(service="qbo_pipeline_qa")
     parser = argparse.ArgumentParser(
         description="Ask questions in plain English (OpenAI gpt-4 first, then Gemini fallback).",
     )

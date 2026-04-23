@@ -7,8 +7,12 @@ from decimal import Decimal
 from typing import Any
 from uuid import UUID
 
-import psycopg2
 from psycopg2.extras import RealDictCursor
+
+from qbo_pipeline.db.pool import pooled_connection
+from qbo_pipeline.observability import get_logger
+
+logger = get_logger(__name__)
 
 
 def _serialize(val: Any) -> Any:
@@ -31,27 +35,32 @@ def _rows(cur) -> list[dict[str, Any]]:
     return out
 
 
-def _one(database_url: str, sql: str, params: tuple | None = None) -> dict[str, Any] | None:
-    conn = psycopg2.connect(database_url)
-    try:
+def _one(
+    database_url: str, sql: str, params: tuple | None = None, *, query_name: str
+) -> dict[str, Any] | None:
+    logger.info("analytics_query_started", query_name=query_name)
+    with pooled_connection(database_url) as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(sql, params or ())
             row = cur.fetchone()
             if not row:
+                logger.info("analytics_query_completed", query_name=query_name, row_count=0)
                 return None
-            return {k: _serialize(v) for k, v in dict(row).items()}
-    finally:
-        conn.close()
+            out = {k: _serialize(v) for k, v in dict(row).items()}
+            logger.info("analytics_query_completed", query_name=query_name, row_count=1)
+            return out
 
 
-def _all(database_url: str, sql: str, params: tuple | None = None) -> list[dict[str, Any]]:
-    conn = psycopg2.connect(database_url)
-    try:
+def _all(
+    database_url: str, sql: str, params: tuple | None = None, *, query_name: str
+) -> list[dict[str, Any]]:
+    logger.info("analytics_query_started", query_name=query_name)
+    with pooled_connection(database_url) as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(sql, params or ())
-            return _rows(cur)
-    finally:
-        conn.close()
+            out = _rows(cur)
+            logger.info("analytics_query_completed", query_name=query_name, row_count=len(out))
+            return out
 
 
 def overview(database_url: str) -> dict[str, Any]:
@@ -64,7 +73,7 @@ def overview(database_url: str) -> dict[str, Any]:
       (SELECT COALESCE(SUM(total_amount), 0) FROM public.invoices) AS total_invoiced,
       (SELECT COALESCE(SUM(total_amount), 0) FROM public.payments) AS total_payments_recorded
     """
-    row = _one(database_url, sql)
+    row = _one(database_url, sql, query_name="overview")
     return row or {}
 
 
@@ -78,7 +87,7 @@ def invoices_paid_vs_unpaid(database_url: str) -> dict[str, Any]:
       COALESCE(SUM(total_amount) FILTER (WHERE balance > 0), 0) AS unpaid_total_billed
     FROM public.invoices
     """
-    row = _one(database_url, sql)
+    row = _one(database_url, sql, query_name="invoices_paid_vs_unpaid")
     return row or {}
 
 
@@ -93,7 +102,7 @@ def invoices_sent_vs_unsent(database_url: str) -> dict[str, Any]:
     GROUP BY is_email_sent
     ORDER BY is_email_sent DESC
     """
-    rows = _all(database_url, sql)
+    rows = _all(database_url, sql, query_name="invoices_sent_vs_unsent")
     return {"buckets": rows}
 
 
@@ -115,7 +124,7 @@ def invoices_overdue_vs_current(database_url: str) -> dict[str, Any]:
       ), 0) AS current_unpaid_amount
     FROM public.invoices
     """
-    row = _one(database_url, sql)
+    row = _one(database_url, sql, query_name="invoices_overdue_vs_current")
     return row or {}
 
 
@@ -132,7 +141,7 @@ def customers_top_paying(database_url: str, limit: int = 10) -> dict[str, Any]:
     ORDER BY total_payments DESC NULLS LAST
     LIMIT %s
     """
-    return {"customers": _all(database_url, sql, (lim,))}
+    return {"customers": _all(database_url, sql, (lim,), query_name="customers_top_paying")}
 
 
 def customers_top_outstanding(database_url: str, limit: int = 10) -> dict[str, Any]:
@@ -148,7 +157,11 @@ def customers_top_outstanding(database_url: str, limit: int = 10) -> dict[str, A
     ORDER BY c.balance DESC
     LIMIT %s
     """
-    return {"customers": _all(database_url, sql, (lim,))}
+    return {
+        "customers": _all(
+            database_url, sql, (lim,), query_name="customers_top_outstanding"
+        )
+    }
 
 
 def customers_top_overdue_debt(database_url: str, limit: int = 10) -> dict[str, Any]:
@@ -168,7 +181,11 @@ def customers_top_overdue_debt(database_url: str, limit: int = 10) -> dict[str, 
     ORDER BY overdue_open_balance DESC
     LIMIT %s
     """
-    return {"customers": _all(database_url, sql, (lim,))}
+    return {
+        "customers": _all(
+            database_url, sql, (lim,), query_name="customers_top_overdue_debt"
+        )
+    }
 
 
 def invoices_paid_on_time_vs_late(database_url: str) -> dict[str, Any]:
@@ -200,7 +217,7 @@ def invoices_paid_on_time_vs_late(database_url: str) -> dict[str, Any]:
       ) AS paid_unknown_timing_count
     FROM last_pay
     """
-    row = _one(database_url, sql)
+    row = _one(database_url, sql, query_name="invoices_paid_on_time_vs_late")
     return row or {}
 
 
@@ -240,7 +257,11 @@ def customers_best_on_time_payers(database_url: str, limit: int = 10) -> dict[st
     ORDER BY on_time_paid_invoice_count DESC, late_paid_invoice_count ASC
     LIMIT %s
     """
-    return {"customers": _all(database_url, sql, (lim,))}
+    return {
+        "customers": _all(
+            database_url, sql, (lim,), query_name="customers_best_on_time_payers"
+        )
+    }
 
 
 def payments_by_month(database_url: str) -> dict[str, Any]:
@@ -254,7 +275,7 @@ def payments_by_month(database_url: str) -> dict[str, Any]:
     GROUP BY DATE_TRUNC('month', txn_date)
     ORDER BY month ASC
     """
-    return {"series": _all(database_url, sql)}
+    return {"series": _all(database_url, sql, query_name="payments_by_month")}
 
 
 def allocations_summary(database_url: str) -> dict[str, Any]:
@@ -266,5 +287,5 @@ def allocations_summary(database_url: str) -> dict[str, Any]:
       COUNT(DISTINCT invoice_id) AS invoices_with_allocations
     FROM public.payment_invoice_allocations
     """
-    row = _one(database_url, sql)
+    row = _one(database_url, sql, query_name="allocations_summary")
     return row or {}

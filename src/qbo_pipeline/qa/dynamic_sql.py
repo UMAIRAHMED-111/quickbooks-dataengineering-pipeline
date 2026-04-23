@@ -5,9 +5,11 @@ from __future__ import annotations
 import re
 from typing import Any
 
-import psycopg2
 import sqlglot
 from sqlglot import exp
+
+from qbo_pipeline.db.pool import pooled_connection
+from qbo_pipeline.observability import get_logger
 
 ALLOWED_TABLES = frozenset(
     {
@@ -21,6 +23,7 @@ ALLOWED_TABLES = frozenset(
 
 MAX_ROWS_RETURNED = 500
 STATEMENT_TIMEOUT_MS = 15_000
+logger = get_logger(__name__)
 
 # Compact schema hint for the SQL generator (keep aligned with migration).
 SCHEMA_FOR_LLM = """
@@ -75,6 +78,7 @@ def _collect_cte_aliases(expr: exp.Expression) -> set[str]:
 def validate_readonly_select(sql: str) -> str:
     """Parse SQL; allow only SELECT / WITH … SELECT; base tables must be in ALLOWED_TABLES (public)."""
     text = _strip_sql_fences(sql)
+    logger.info("dynamic_sql_validate_started", sql_length=len(text))
     if not text:
         raise ValueError("Model returned empty SQL")
     if ";" in text.rstrip().rstrip(";"):
@@ -115,6 +119,7 @@ def validate_readonly_select(sql: str) -> str:
         if str(base).lower() not in ALLOWED_TABLES:
             raise ValueError(f"Table not allowed: {base}")
 
+    logger.info("dynamic_sql_validate_completed")
     return text
 
 
@@ -128,9 +133,13 @@ def execute_validated_select(
     """
     Run validated SQL. Returns (column_names, rows, truncated).
     """
-    conn = psycopg2.connect(database_url)
     truncated = False
-    try:
+    logger.info(
+        "dynamic_sql_execute_started",
+        max_rows=max_rows,
+        timeout_ms=timeout_ms,
+    )
+    with pooled_connection(database_url, autocommit=True) as conn:
         conn.autocommit = True
         with conn.cursor() as cur:
             cur.execute("SET statement_timeout = %s", (int(timeout_ms),))
@@ -140,8 +149,12 @@ def execute_validated_select(
             if len(rows) > max_rows:
                 truncated = True
                 rows = rows[:max_rows]
-    finally:
-        conn.close()
+    logger.info(
+        "dynamic_sql_execute_completed",
+        column_count=len(colnames),
+        row_count=len(rows),
+        truncated=truncated,
+    )
     return colnames, rows, truncated
 
 

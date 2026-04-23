@@ -22,8 +22,10 @@ from repo_bootstrap import configure_for_checkout
 
 configure_for_checkout(Path(__file__))
 
+from qbo_pipeline.observability import configure_logging  # noqa: E402
 from qbo_pipeline.web.app import create_app  # noqa: E402
 
+configure_logging(service="qbo_pipeline_api")
 app = create_app()
 
 if __name__ == "__main__":

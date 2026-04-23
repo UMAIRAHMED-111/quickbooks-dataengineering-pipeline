@@ -13,6 +13,10 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
 
+from qbo_pipeline.observability import get_logger
+
+logger = get_logger(__name__)
+
 
 @dataclass
 class LoadBundle:
@@ -84,14 +88,22 @@ def transform(payload: dict[str, Any]) -> LoadBundle:
     raw_customers = payload.get("customers") or []
     raw_invoices = payload.get("invoices") or []
     raw_payments = payload.get("payments") or []
+    logger.info(
+        "transform_started",
+        raw_customers=len(raw_customers),
+        raw_invoices=len(raw_invoices),
+        raw_payments=len(raw_payments),
+    )
 
     # Map QuickBooks string Id -> new UUID we will insert as PK
     customer_by_qbo: dict[str, uuid.UUID] = {}
     customer_rows: list[dict[str, Any]] = []
 
+    skipped_customers_missing_id = 0
     for c in raw_customers:
         qid = str(c.get("Id", "")).strip()
         if not qid:
+            skipped_customers_missing_id += 1
             continue
         cid = uuid.uuid4()
         customer_by_qbo[qid] = cid
@@ -124,15 +136,19 @@ def transform(payload: dict[str, Any]) -> LoadBundle:
     invoice_by_qbo: dict[str, uuid.UUID] = {}
     invoice_rows: list[dict[str, Any]] = []
 
+    skipped_invoices_missing_id = 0
+    skipped_invoices_orphan_customer = 0
     for inv in raw_invoices:
         qid = str(inv.get("Id", "")).strip()
         if not qid:
+            skipped_invoices_missing_id += 1
             continue
         cref = inv.get("CustomerRef") or {}
         cust_q = str(cref.get("value", "")).strip()
         cust_id = customer_by_qbo.get(cust_q)
         if cust_id is None:
             # Orphan invoice relative to this payload — skip instead of breaking FK
+            skipped_invoices_orphan_customer += 1
             continue
         iid = uuid.uuid4()
         invoice_by_qbo[qid] = iid
@@ -167,14 +183,18 @@ def transform(payload: dict[str, Any]) -> LoadBundle:
     # Same payment can touch the same invoice on multiple lines — sum into one row later
     alloc_sums: defaultdict[tuple[str, str], Decimal] = defaultdict(Decimal)
 
+    skipped_payments_missing_id = 0
+    skipped_payments_orphan_customer = 0
     for pay in raw_payments:
         pqid = str(pay.get("Id", "")).strip()
         if not pqid:
+            skipped_payments_missing_id += 1
             continue
         cref = pay.get("CustomerRef") or {}
         cust_q = str(cref.get("value", "")).strip()
         cust_id = customer_by_qbo.get(cust_q)
         if cust_id is None:
+            skipped_payments_orphan_customer += 1
             continue
         pid = uuid.uuid4()
         payment_by_qbo[pqid] = pid
@@ -204,11 +224,13 @@ def transform(payload: dict[str, Any]) -> LoadBundle:
                     alloc_sums[(pqid, inv_qbo_id)] += amt
 
     allocation_rows: list[dict[str, Any]] = []
+    skipped_allocations_orphan_refs = 0
     for (pqid, iqid), amt in alloc_sums.items():
         pid = payment_by_qbo.get(pqid)
         iid = invoice_by_qbo.get(iqid)
         if pid is None or iid is None:
             # Payment points at an invoice we did not load (e.g. skipped invoice)
+            skipped_allocations_orphan_refs += 1
             continue
         allocation_rows.append(
             {
@@ -219,9 +241,23 @@ def transform(payload: dict[str, Any]) -> LoadBundle:
             }
         )
 
-    return LoadBundle(
+    bundle = LoadBundle(
         customers=customer_rows,
         invoices=invoice_rows,
         payments=payment_rows,
         payment_invoice_allocations=allocation_rows,
     )
+    logger.info(
+        "transform_completed",
+        customers=len(bundle.customers),
+        invoices=len(bundle.invoices),
+        payments=len(bundle.payments),
+        allocations=len(bundle.payment_invoice_allocations),
+        skipped_customers_missing_id=skipped_customers_missing_id,
+        skipped_invoices_missing_id=skipped_invoices_missing_id,
+        skipped_invoices_orphan_customer=skipped_invoices_orphan_customer,
+        skipped_payments_missing_id=skipped_payments_missing_id,
+        skipped_payments_orphan_customer=skipped_payments_orphan_customer,
+        skipped_allocations_orphan_refs=skipped_allocations_orphan_refs,
+    )
+    return bundle
